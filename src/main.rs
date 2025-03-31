@@ -1,126 +1,175 @@
-    use crossbeam_channel::unbounded;
-    use win_hotkeys::{HotkeyManager, VKey};
-    use winit::{
-        event::{Event, WindowEvent},
-        event_loop::{ControlFlow, EventLoop, EventLoopBuilder},
-        window::{WindowBuilder},
+use std::process;
+use std::sync::Arc;
+use winit::{
+    event::{Event, WindowEvent},
+    event_loop::{ControlFlow, EventLoop},
+    window::WindowBuilder,
+};
+use wgpu::{Instance, RequestAdapterOptions, StoreOp};
+use egui_winit::State;
+use egui;
+use egui_wgpu::Renderer;
+use egui_wgpu::ScreenDescriptor;
+
+async fn run(event_loop: EventLoop<()>, window: Arc<winit::window::Window>) {
+    // WGPU Initialization
+    let instance = Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::all(),
+        ..Default::default()
+    });
+
+    let surface = unsafe { instance.create_surface(&window).unwrap() };
+
+    let adapter = instance
+        .request_adapter(&RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: Some(&surface),
+            force_fallback_adapter: false,
+        })
+        .await
+        .unwrap();
+
+    let (device, queue) = adapter
+        .request_device(
+            &wgpu::DeviceDescriptor {
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::default(),
+                label: None,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    let surface_caps = surface.get_capabilities(&adapter);
+    let surface_format = surface_caps.formats[0];
+    let mut config = wgpu::SurfaceConfiguration {
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        format: surface_format,
+        width: window.inner_size().width,
+        height: window.inner_size().height,
+        present_mode: wgpu::PresentMode::Fifo,
+        alpha_mode: surface_caps.alpha_modes[0],
+        view_formats: vec![],
+        desired_maximum_frame_latency: 2,
     };
-    use std::sync::{Arc, Mutex};
-    use std::thread;
-    use std::ffi::c_void;
-    use winit::platform::windows::WindowExtWindows;
+    surface.configure(&device, &config);
 
-    use windows_sys::Win32::Foundation::HWND;
-    use windows_sys::Win32::Graphics::Gdi::{
-        BeginPaint, EndPaint, FillRect, PAINTSTRUCT, CreateSolidBrush, DeleteObject,
-    };
+    // Egui Initialization
+    let mut state = State::new(
+        egui::Context::default(),
+        egui::ViewportId::ROOT,
+        &window,
+        None,
+        None,
+    );
 
+    let mut renderer = Renderer::new(
+        &device,
+        surface_format,
+        None,
+        1
+    );
 
-    #[derive(Debug, Clone, Copy)]
-    enum CustomEvent {
-        ToggleVisibility,
-    }
+    let window_clone = Arc::clone(&window);
+    event_loop.run(move |event, elwt| {
+        elwt.set_control_flow(ControlFlow::Poll);
 
-    fn main() {
-        
-        let event_loop: EventLoop<CustomEvent> = EventLoopBuilder::with_user_event().build();
-        let event_proxy = event_loop.create_proxy(); 
+        match event {
+            Event::WindowEvent { event, window_id } if window_id == window_clone.id() => {
+                match event {
+                    WindowEvent::CloseRequested => process::exit(0),
+                    WindowEvent::Resized(new_size) => {
+                        config.width = new_size.width;
+                        config.height = new_size.height;
+                        surface.configure(&device, &config);
+                        window_clone.request_redraw();
+                    }
+                    WindowEvent::RedrawRequested => {
+                        // Handle rendering
+                        let raw_input = state.take_egui_input(&window_clone);
+                        let full_output = state.egui_ctx().run(raw_input, |ctx| {
+                            egui::CentralPanel::default().show(ctx, |ui| {
+                                ui.label("Hello from Egui!");
+                                if ui.button("Close").clicked() {
+                                    process::exit(0);
+                                }
+                            });
+                        });
 
-        let mut hkm = HotkeyManager::new();
+                        let paint_jobs = state.egui_ctx().tessellate(
+                            full_output.shapes,
+                            window_clone.scale_factor() as f32
+                        );
 
-        
-        let (tx, _rx) = unbounded();  
-        hkm.register_channel(tx);
+                        let textures_delta = full_output.textures_delta;
+                        let frame = surface.get_current_texture().unwrap();
+                        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        let backquote = VKey::from_vk_code(0xC0);
+                        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+                        
+                        let screen_descriptor = ScreenDescriptor {
+                            size_in_pixels: [config.width, config.height],
+                            pixels_per_point: window_clone.scale_factor() as f32,
+                        };
+                        
+                        renderer.update_buffers(
+                            &device,
+                            &queue,
+                            &mut encoder,
+                            &paint_jobs,
+                            &screen_descriptor,
+                        );
+                        
+                        for (id, image_delta) in &textures_delta.set {
+                            renderer.update_texture(&device, &queue, *id, image_delta);
+                        }
 
-        
-        let last_time = Arc::new(Mutex::new(std::time::Instant::now()));
+                        let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("egui_render_pass"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: &view,
+                                resolve_target: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                    store: StoreOp::Store,
+                                },
+                            })],
+                            depth_stencil_attachment: None,
+                            occlusion_query_set: None,
+                            timestamp_writes: None,
+                        });
 
-        
-        hkm.register_hotkey(backquote, &[VKey::Control], {
-            let last_time = Arc::clone(&last_time);
-            let event_proxy = event_proxy.clone();
-            move || {
-                let now = std::time::Instant::now();
-                let mut last_time_guard = last_time.lock().unwrap();
-                
-                if now.duration_since(*last_time_guard) > std::time::Duration::from_millis(300) {
-                    *last_time_guard = now;
-                    println!("Ctrl +  hotkey pressed");
-                    let _ = event_proxy.send_event(CustomEvent::ToggleVisibility); 
+                        renderer.render(&mut render_pass, &paint_jobs, &screen_descriptor);
+                        drop(render_pass);
+
+                        queue.submit(Some(encoder.finish()));
+                        frame.present();
+                    }
+                    _ => {
+                        let response = state.on_window_event(&window_clone, &event);
+                        if response.consumed {
+                            return;
+                        }
+                    }
                 }
             }
-        })
-        .expect("Failed to register Ctrl+ hotkey");
-
-        hkm.register_hotkey(backquote, &[VKey::LWin], {
-            let last_time = Arc::clone(&last_time);
-            let event_proxy = event_proxy.clone();
-            move || {
-                let now = std::time::Instant::now();
-                let mut last_time_guard = last_time.lock().unwrap();
-
-                if now.duration_since(*last_time_guard) > std::time::Duration::from_millis(300) {
-                    *last_time_guard = now;
-                    println!("Meta +  hotkey pressed");
-                    let _ = event_proxy.send_event(CustomEvent::ToggleVisibility); 
-                }
+            Event::AboutToWait => {
+                window_clone.request_redraw();
             }
-        })
-        .expect("Failed to register Meta+ hotkey");
+            _ => {}
+        }
+    });
+}
 
-        
-        let window = WindowBuilder::new()
-            .with_title("Quake Terminal")
-            .with_decorations(false)
-            .with_transparent(true)
-            .with_inner_size(winit::dpi::LogicalSize::new(800, 400))
+fn main() {
+    let event_loop = EventLoop::new().unwrap();
+    let window = Arc::new(
+        WindowBuilder::new()
+            .with_title("Egui + WGPU")
             .build(&event_loop)
-            .unwrap();
+            .unwrap()
+    );
 
-        window.set_visible(true);
-        let mut visible = true;
-
-        
-        thread::spawn(move || {
-            hkm.event_loop();
-        });
-
-        
-        event_loop.run(move |event, _, control_flow| {
-            *control_flow = ControlFlow::Wait;
-            match event {
-                
-                Event::UserEvent(CustomEvent::ToggleVisibility) => {
-                    visible = !visible;
-                    println!("Toggling visibility: {}", visible);
-                    window.set_visible(visible);
-                    if visible {
-                    
-                    }
-                }
-                Event::WindowEvent { event, .. } => {
-                    if let WindowEvent::CloseRequested = event {
-                        *control_flow = ControlFlow::Exit;
-                    }
-                }
-                Event::RedrawRequested(_) => {
-                    // Cast the window handle to HWND (which is a type alias, not a constructor)
-                    let hwnd = window.hwnd() as HWND;
-                    // Initialize PAINTSTRUCT using zeroed memory
-                    let mut ps: PAINTSTRUCT = unsafe { std::mem::zeroed() };
-                    unsafe {
-                        let hdc = BeginPaint(hwnd, &mut ps);
-                        // Use a u32 literal for COLORREF instead of calling a constructor
-                        let hbr = CreateSolidBrush(0x2ba5u32);
-                        FillRect(hdc, &ps.rcPaint, hbr);
-                        let _ = DeleteObject(hbr as _);
-                        EndPaint(hwnd, &ps);
-                    }
-                },
-                
-                _ => (),
-            }
-        });
-    }
+    pollster::block_on(run(event_loop, window));
+}
