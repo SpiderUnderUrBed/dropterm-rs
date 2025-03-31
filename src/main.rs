@@ -1,86 +1,126 @@
-use egui::{RawInput, Context};
-use winit::{event::{Event, WindowEvent}, event_loop::{ControlFlow, EventLoop}, window::WindowBuilder};
-use wgpu::{Instance, Device, Queue, RequestAdapterOptions};
-use egui_wgpu::Renderer;
-use egui_winit::{State, egui, egui::viewport::ViewportId};
+    use crossbeam_channel::unbounded;
+    use win_hotkeys::{HotkeyManager, VKey};
+    use winit::{
+        event::{Event, WindowEvent},
+        event_loop::{ControlFlow, EventLoop, EventLoopBuilder},
+        window::{WindowBuilder},
+    };
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::ffi::c_void;
+    use winit::platform::windows::WindowExtWindows;
 
-use std::process;
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::Graphics::Gdi::{
+        BeginPaint, EndPaint, FillRect, PAINTSTRUCT, CreateSolidBrush, DeleteObject,
+    };
 
-async fn run(event_loop: EventLoop<()>, window: winit::window::Window) {
-    let instance = Instance::new(wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::all(),
-        ..Default::default()
-    });
 
-    let adapter = instance.request_adapter(&RequestAdapterOptions {
-        power_preference: wgpu::PowerPreference::HighPerformance,
-        compatible_surface: None,
-        force_fallback_adapter: false,
-    })
-    .await
-    .expect("Failed to find an adapter");
+    #[derive(Debug, Clone, Copy)]
+    enum CustomEvent {
+        ToggleVisibility,
+    }
 
-    let (device, queue) = adapter.request_device(&wgpu::DeviceDescriptor {
-        label: None,
-        required_features: wgpu::Features::empty(),
-        required_limits: wgpu::Limits::default(),
-    }, None)
-    .await
-    .expect("Failed to create device and queue");
+    fn main() {
+        
+        let event_loop: EventLoop<CustomEvent> = EventLoopBuilder::with_user_event().build();
+        let event_proxy = event_loop.create_proxy(); 
 
-    let mut state = State::new(
-        egui::Context::default(),
-        ViewportId::ROOT,
-        &window,
-        None,
-        None,
-    );
+        let mut hkm = HotkeyManager::new();
 
-    // Initialize the renderer with the device
-    let mut renderer = Renderer::new(&device, wgpu::TextureFormat::Bgra8UnormSrgb, None, 1);
+        
+        let (tx, _rx) = unbounded();  
+        hkm.register_channel(tx);
 
-    // Event loop
-    event_loop.run(move |event, control_flow| {
-        match event {
-            Event::WindowEvent { event, .. } => match event {
-                WindowEvent::CloseRequested => {
-                    std::process::exit(0);
+        let backquote = VKey::from_vk_code(0xC0);
+
+        
+        let last_time = Arc::new(Mutex::new(std::time::Instant::now()));
+
+        
+        hkm.register_hotkey(backquote, &[VKey::Control], {
+            let last_time = Arc::clone(&last_time);
+            let event_proxy = event_proxy.clone();
+            move || {
+                let now = std::time::Instant::now();
+                let mut last_time_guard = last_time.lock().unwrap();
+                
+                if now.duration_since(*last_time_guard) > std::time::Duration::from_millis(300) {
+                    *last_time_guard = now;
+                    println!("Ctrl +  hotkey pressed");
+                    let _ = event_proxy.send_event(CustomEvent::ToggleVisibility); 
                 }
-                WindowEvent::RedrawRequested => {
-                    // Create an empty RawInput if you don't have actual input handling yet
-                    let raw_input = RawInput::default();
+            }
+        })
+        .expect("Failed to register Ctrl+ hotkey");
 
-                    // Make sure the fonts are initialized by accessing the context
-                    state.egui_ctx().run(raw_input, move |ctx| {
-                        egui::CentralPanel::default().show(ctx, |ui| {
-                            ui.label("Hello from Egui!");
-                            if ui.button("Close").clicked() {
-                                std::process::exit(0);
-                            }
-                        });
-                    });
+        hkm.register_hotkey(backquote, &[VKey::LWin], {
+            let last_time = Arc::clone(&last_time);
+            let event_proxy = event_proxy.clone();
+            move || {
+                let now = std::time::Instant::now();
+                let mut last_time_guard = last_time.lock().unwrap();
 
-                    window.request_redraw(); // Request a redraw to update the window
+                if now.duration_since(*last_time_guard) > std::time::Duration::from_millis(300) {
+                    *last_time_guard = now;
+                    println!("Meta +  hotkey pressed");
+                    let _ = event_proxy.send_event(CustomEvent::ToggleVisibility); 
                 }
-                _ => {}
-            },
-            _ => {}
-        }
+            }
+        })
+        .expect("Failed to register Meta+ hotkey");
 
-        // Control flow is handled by event_loop.run() itself.
-    });
-}
+        
+        let window = WindowBuilder::new()
+            .with_title("Quake Terminal")
+            .with_decorations(false)
+            .with_transparent(true)
+            .with_inner_size(winit::dpi::LogicalSize::new(800, 400))
+            .build(&event_loop)
+            .unwrap();
 
-fn main() {
-    // Create the event loop (unwrap the result)
-    let event_loop = EventLoop::new().expect("Failed to create event loop");
-    
-    // Build the window (unwrap the result)
-    let window = WindowBuilder::new()
-        .with_title("Egui + WGPU")
-        .build(&event_loop)
-        .expect("Failed to create window");
+        window.set_visible(true);
+        let mut visible = true;
 
-    // Run the application with the unwrapped event loop and window
-    pollster::block_on(run(event_loop, window));
-}
+        
+        thread::spawn(move || {
+            hkm.event_loop();
+        });
+
+        
+        event_loop.run(move |event, _, control_flow| {
+            *control_flow = ControlFlow::Wait;
+            match event {
+                
+                Event::UserEvent(CustomEvent::ToggleVisibility) => {
+                    visible = !visible;
+                    println!("Toggling visibility: {}", visible);
+                    window.set_visible(visible);
+                    if visible {
+                    
+                    }
+                }
+                Event::WindowEvent { event, .. } => {
+                    if let WindowEvent::CloseRequested = event {
+                        *control_flow = ControlFlow::Exit;
+                    }
+                }
+                Event::RedrawRequested(_) => {
+                    // Cast the window handle to HWND (which is a type alias, not a constructor)
+                    let hwnd = window.hwnd() as HWND;
+                    // Initialize PAINTSTRUCT using zeroed memory
+                    let mut ps: PAINTSTRUCT = unsafe { std::mem::zeroed() };
+                    unsafe {
+                        let hdc = BeginPaint(hwnd, &mut ps);
+                        // Use a u32 literal for COLORREF instead of calling a constructor
+                        let hbr = CreateSolidBrush(0x2ba5u32);
+                        FillRect(hdc, &ps.rcPaint, hbr);
+                        let _ = DeleteObject(hbr as _);
+                        EndPaint(hwnd, &ps);
+                    }
+                },
+                
+                _ => (),
+            }
+        });
+    }
